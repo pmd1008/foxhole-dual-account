@@ -1,0 +1,248 @@
+#!/bin/bash
+# seat2-start — second MPX seat for the Foxhole dual-account setup.
+#
+# Creates the XInput2 master pair "second pointer"/"second keyboard", attaches the
+# second physical keyboard/mouse to it, and starts the focus/client-pointer daemons.
+# Only works in a real Xorg session (Plasma X11 / Openbox), NOT in Wayland/Xwayland.
+#
+#   seat2-start            start (idempotent)
+#   seat2-start stop       stop daemons, return devices to the core seat
+#   seat2-start status     show masters, devices and daemon pids
+#
+# Environment overrides (useful for tests / different hardware):
+#   MPX_KBD_NAME     default: CASUE USB KB
+#   MPX_MOUSE_NAME   default: SIGMACHIP Usb Mouse
+#   MPX_MASTER_NAME  default: second
+set -u
+
+LOG="${SEAT2_LOG:-/tmp/seat2-start-$(id -u).log}"
+MASTER="${MPX_MASTER_NAME:-second}"
+# Какие устройства отданы второму месту: ~/.config/foxhole-dual/devices.conf
+# (пишется `foxhole-input setup`). Переменные MPX_* имеют приоритет.
+USER_HOME="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
+DEVCONF="${XDG_CONFIG_HOME:-$USER_HOME/.config}/foxhole-dual/devices.conf"
+[ -r "$DEVCONF" ] && . "$DEVCONF"
+KBD="${MPX_KBD_NAME:-${seat2_keyboard:-CASUE USB KB}}"
+MOUSE="${MPX_MOUSE_NAME:-${seat2_mouse:-SIGMACHIP Usb Mouse}}"
+# Суб-устройства второй пары (чего нет — пропускается при привязке)
+EXTRA=(
+  "keyboard:${KBD} Consumer Control"
+  "keyboard:${KBD} System Control"
+  "pointer:${MOUSE} Keyboard"
+  "keyboard:${MOUSE} Keyboard"
+)
+[ "${MPX_NO_EXTRA:-0}" = 1 ] && EXTRA=()
+FOCUSPIN=/usr/local/bin/seat2-focuspin
+LAYOUTD=/usr/local/bin/seat2-layoutd
+PYC=/usr/local/bin/__pycache__
+FOCUSD="$PYC/seat2-focusdcpython-314.pyc"
+CPD="$PYC/seat2-cpcpython-314.pyc"
+CP_RESET="$PYC/seat2-cp-resetcpython-314.pyc"
+
+mkdir -p "$(dirname "$LOG")"
+log() {
+  local m
+  m="$(date -Is) $*"
+  printf '%s\n' "$m" >>"$LOG"
+  printf '%s\n' "$m"
+}
+
+xenv() {
+  export DISPLAY="${DISPLAY:-:0}"
+  if [ -z "${XAUTHORITY:-}" ] || [ ! -r "${XAUTHORITY:-}" ]; then
+    local a
+    a=$(ls -t "/run/user/$(id -u)"/xauth_* 2>/dev/null | head -1 || true)
+    [ -n "$a" ] && export XAUTHORITY="$a"
+  fi
+}
+
+# xinput's own name matching is unusable here: X11 device names may carry a
+# trailing space ("INSTANT USB GAMING MOUSE "), and a name can exist twice
+# (pointer + keyboard class of the same physical mouse). Enumerate the table
+# and resolve ids ourselves; reattach goes by id, never by name.
+#
+# Output rows: "<id>|<class>|<name>", name trimmed and spaces collapsed.
+dev_rows() {
+  xinput list --short 2>/dev/null | awk -F'\t' '
+    NF >= 3 && $2 ~ /^id=/ {
+      id = substr($2, 4)
+      cls = $3
+      gsub(/^\[|\][[:space:]]*$/, "", cls)
+      name = $1
+      sub(/^[^[:alnum:]]+/, "", name)
+      gsub(/[[:space:]]+/, " ", name)
+      gsub(/^ | $/, "", name)
+      printf "%s|%s|%s\n", id, cls, name
+    }'
+}
+
+# find_dev <name> [class-substring] -> id
+find_dev() {
+  local want cls id c n
+  want=$(printf '%s' "$1" | tr -s ' ' | sed -e 's/^ *//' -e 's/ *$//')
+  cls="${2:-}"
+  while IFS='|' read -r id c n; do
+    [ "$n" = "$want" ] || continue
+    if [ -z "$cls" ]; then printf '%s\n' "$id"; return 0; fi
+    case "$c" in
+      *"$cls"*) printf '%s\n' "$id"; return 0 ;;
+    esac
+  done < <(dev_rows)
+  return 1
+}
+
+find_id() { find_dev "$1" ""; }
+
+attach() {
+  local name="$1" master="$2" cls="" id
+  case "$name" in
+    *:*) cls="${name%%:*}"; name="${name#*:}" ;;
+  esac
+  id=$(find_dev "$name" "$cls")
+  if [ -z "$id" ]; then
+    log "attach: device not found: $name${cls:+ (class $cls)}"
+    return 1
+  fi
+  if xinput reattach "$id" "$master" 2>/dev/null; then
+    log "attach: $name${cls:+ [$cls]} (id=$id) -> $master"
+  else
+    log "attach: FAILED $name${cls:+ [$cls]} (id=$id) -> $master"
+    return 1
+  fi
+}
+
+start_pyc() {
+  local marker="$1"; shift
+  local pid
+  for pid in $(pgrep -f "$marker" 2>/dev/null || true); do
+    if ! tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx "DISPLAY=$DISPLAY"; then
+      kill "$pid" 2>/dev/null || true
+      log "killed stale daemon pid=$pid (wrong display): $marker"
+    fi
+  done
+  if pgrep -f "$marker" >/dev/null 2>&1; then
+    log "daemon already running: $marker"
+    return 0
+  fi
+  setsid -f "$@" >>"$LOG" 2>&1
+  log "started: $*"
+}
+
+stop_daemons() {
+  local p
+  for p in "$FOCUSD" "$FOCUSPIN" "$LAYOUTD" "$CPD"; do
+    local base
+    base=$(basename "$p")
+    while read -r pid; do
+      [ -n "$pid" ] || continue
+      kill "$pid" 2>/dev/null || true
+      log "stopped pid=$pid ($base)"
+    done < <(pgrep -f "$base" 2>/dev/null || true)
+  done
+}
+
+reattach_core() {
+  local name id
+  for name in "$KBD" "$MOUSE" "${EXTRA[@]}"; do
+    case "$name" in *:*) name="${name#*:}" ;; esac
+    id=$(find_id "$name")
+    [ -n "$id" ] || continue
+    if xinput list --short | awk -F'\t' -v i="$id" '$2=="id="i {print $3}' | grep -q 'pointer'; then
+      xinput reattach "$id" "Virtual core pointer" 2>/dev/null || true
+    else
+      xinput reattach "$id" "Virtual core keyboard" 2>/dev/null || true
+    fi
+  done
+}
+
+case "${1:-start}" in
+  status)
+    xenv
+    echo "== masters =="; xinput list | sed -n '/master pointer\|master keyboard/p'
+    echo "== daemons =="; pgrep -af 'seat2-(focusd|cp)' || true
+    exit 0
+    ;;
+  stop)
+    xenv
+    # KWin 6.7.x aborts (SIGABRT) when an XInput master is removed or when the
+    # second pair is reattached away from it during a live Plasma X11 session.
+    # Verified 13.11.2026: 'stop' killed plasma-kwin_x11 and the whole desktop.
+    # So on a live session we only stop the daemons and leave the master alone.
+    if [ "${2:-}" != "--force" ] && { pgrep -x kwin_x11 >/dev/null || pgrep -x plasmashell >/dev/null; }; then
+      stop_daemons
+      log "live Plasma X11 session: master left in place (device detach crashes kwin_x11)."
+      log "full cleanup: log out / reboot, or run 'seat2-start stop --force' and expect the session to die."
+      exit 0
+    fi
+    stop_daemons
+    reattach_core
+    if xinput list --name-only | grep -Fxq "$MASTER pointer"; then
+      xinput remove-master "$MASTER pointer" AttachToMaster "Virtual core pointer" "Virtual core keyboard" 2>/dev/null \
+        || xinput remove-master "$MASTER pointer" 2>/dev/null || true
+    fi
+    log "stopped, devices returned to core"
+    exit 0
+    ;;
+  start) ;;
+  *) echo "usage: $0 [start|stop|status]" >&2; exit 2 ;;
+esac
+
+xenv
+log "start: DISPLAY=$DISPLAY XAUTHORITY=${XAUTHORITY:-} master=$MASTER kbd=$KBD mouse=$MOUSE"
+
+# Wayland/Xwayland has no usable MPX: exit quietly.
+if [ "${XDG_SESSION_TYPE:-}" = "wayland" ] || { [ -n "${WAYLAND_DISPLAY:-}" ] && [ "${XDG_SESSION_TYPE:-}" != "x11" ]; }; then
+  log "Wayland session detected; MPX needs a real Xorg (Plasma X11/Openbox). Exiting."
+  exit 0
+fi
+if xinput list 2>/dev/null | grep -q 'xwayland-'; then
+  log "Xwayland detected; MPX needs a real Xorg. Exiting."
+  exit 0
+fi
+
+for _ in $(seq 1 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
+if ! xdpyinfo >/dev/null 2>&1; then log "no X display on $DISPLAY"; exit 1; fi
+
+for _ in $(seq 1 60); do
+  [ -n "$(find_id "$KBD")" ] && [ -n "$(find_id "$MOUSE")" ] && break
+  sleep 0.5
+done
+if [ -z "$(find_id "$KBD")" ] || [ -z "$(find_id "$MOUSE")" ]; then
+  log "second keyboard/mouse not found (kbd=$KBD mouse=$MOUSE); exiting"
+  exit 1
+fi
+
+if ! xinput list --name-only | grep -Fxq "$MASTER pointer"; then
+  log "creating master: $MASTER"
+  xinput create-master "$MASTER" || { log "create-master failed"; exit 1; }
+fi
+
+attach "$KBD" "$MASTER keyboard" || true
+attach "$MOUSE" "$MASTER pointer" || true
+for name in "${EXTRA[@]}"; do
+  if [ -n "$(find_dev "${name#*:}" "${name%%:*}")" ]; then attach "$name" "$MASTER ${name%%:*}"; fi
+done
+
+# Reset stale ClientPointers to core once, before the CP daemon starts.
+if ! pgrep -f "$(basename "$CPD")" >/dev/null 2>&1 && [ -f "$CP_RESET" ]; then
+  python3 "$CP_RESET" >>"$LOG" 2>&1 || log "cp-reset failed"
+  log "client pointers reset to core"
+fi
+
+if [ -x "$FOCUSPIN" ]; then
+  # Правильный демон: держит XI-фокус второй клавиатуры на окне Wine (WM_STATE),
+  # а не на фрейме KWin. Старый pyc-focusd ставил фокус на фрейм и ломал ввод.
+  start_pyc "$(basename "$FOCUSPIN")" python3 "$FOCUSPIN"
+else
+  start_pyc "$(basename "$FOCUSD")" python3 "$FOCUSD" --keep-core-focus
+fi
+if [ -x "$LAYOUTD" ]; then
+  start_pyc "$(basename "$LAYOUTD")" python3 "$LAYOUTD"
+fi
+if [ -x /usr/local/bin/seat2-cp ]; then
+  start_pyc "seat2-cp" /usr/local/bin/seat2-cp --interval 2
+else
+  start_pyc "$(basename "$CPD")" python3 "$CPD" --interval 2
+fi
+
+log "ready: $MASTER pointer=$(find_id "$MASTER pointer") keyboard=$(find_id "$MASTER keyboard")"

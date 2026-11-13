@@ -1,0 +1,833 @@
+#!/usr/bin/env python3
+"""
+foxhole-input — единый обработчик ввода для двухместной схемы Foxhole.
+
+Один демон делает всё, что раньше делали autoclick + autoclick-hotkey +
+seat2-rmb-hold:
+
+  * автокликер ЛКМ с настраиваемым интервалом (toggle: нажал — пошло, нажал — стоп);
+  * удержание ЛКМ/ПКМ (toggle: нажал — зажато, нажал ещё — отпустило);
+  * привязки на клавиши и на боковые кнопки мышей, у каждой привязки своё место;
+  * клики идут по курсору ТОГО места, с которого пришло нажатие/клавиша:
+    uinput-устройство создаётся и привязывается к нужному XInput2-мастеру;
+  * несколько привязок работают одновременно и независимо (кликер первого
+    места и удержание ПКМ на втором не мешают друг другу).
+
+Команды:
+    foxhole-input run [--config PATH] [-v]   запустить демон (foreground)
+    foxhole-input stop                      остановить демон
+    foxhole-input status                    что запущено и какие привязки
+    foxhole-input doctor                    проверить окружение
+    foxhole-input config                    показать путь и содержимое конфига
+    foxhole-input init [--force]            создать конфиг по умолчанию
+
+Конфиг: ~/.config/foxhole-dual/input.toml (TOML). Пример — в README.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import os
+import re
+import selectors
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+
+# ---------------------------------------------------------------------------
+# uinput: без python-uinput, только ioctl (как в старом autoclick)
+# ---------------------------------------------------------------------------
+UI_SET_EVBIT = 0x40045564
+UI_SET_KEYBIT = 0x40045565
+UI_SET_RELBIT = 0x40045566
+UI_DEV_CREATE = 0x5501
+UI_DEV_DESTROY = 0x5502
+
+EV_SYN, EV_KEY, EV_REL = 0, 1, 2
+BTN_LEFT, BTN_RIGHT = 0x110, 0x111
+BUS_USB = 0x03
+
+BUTTONS = {"left": BTN_LEFT, "right": BTN_RIGHT}
+MASTER_SECOND_POINTER = "second pointer"
+MASTER_CORE_POINTER = "Virtual core pointer"
+
+VERBOSE = False
+
+
+def log(msg: str, *, always: bool = False) -> None:
+    if always or VERBOSE:
+        print(f"foxhole-input: {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# X: какой мастер у места, на каком месте устройство
+# ---------------------------------------------------------------------------
+def _xauth() -> str:
+    a = os.environ.get("XAUTHORITY")
+    if a and os.access(a, os.R_OK):
+        return a
+    import glob
+
+    files = sorted(glob.glob(f"/run/user/{os.getuid()}/xauth_*"), key=os.path.getmtime)
+    return files[-1] if files else ""
+
+
+def _xenv() -> dict:
+    env = dict(os.environ)
+    env.setdefault("DISPLAY", ":0")
+    a = _xauth()
+    if a:
+        env["XAUTHORITY"] = a
+    return env
+
+
+def xinput(*args: str) -> str:
+    try:
+        return subprocess.run(
+            ["xinput", *args], capture_output=True, text=True, env=_xenv(), timeout=5
+        ).stdout
+    except Exception:
+        return ""
+
+
+def master_id(name: str) -> str:
+    ids = [i for i in xinput("list", "--id-only", name).split() if i.isdigit()]
+    return ids[0] if ids else ""
+
+
+def master_name(seat: int) -> str:
+    return MASTER_SECOND_POINTER if seat == 2 else MASTER_CORE_POINTER
+
+
+class UInputDevice:
+    """Виртуальная мышь, привязанная к XInput2-мастеру нужного места."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_REL)
+        for btn in BUTTONS.values():
+            fcntl.ioctl(self.fd, UI_SET_KEYBIT, btn)
+        fcntl.ioctl(self.fd, UI_SET_RELBIT, 0)  # REL_X
+        fcntl.ioctl(self.fd, UI_SET_RELBIT, 1)  # REL_Y
+        dev = struct.pack("80sHHHH", name.encode()[:79], BUS_USB, 0x1234, 0x5678, 1)
+        dev += b"\x00" * (4 * 64 * 4 + 4)
+        os.write(self.fd, dev)
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+        time.sleep(0.2)
+
+    def emit(self, etype: int, code: int, value: int) -> None:
+        os.write(self.fd, struct.pack("llHHi", 0, 0, etype, code, value))
+
+    def press(self, button: str) -> None:
+        self.emit(EV_KEY, BUTTONS[button], 1)
+        self.emit(EV_SYN, 0, 0)
+
+    def release(self, button: str) -> None:
+        self.emit(EV_KEY, BUTTONS[button], 0)
+        self.emit(EV_SYN, 0, 0)
+
+    def close(self) -> None:
+        try:
+            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+        except OSError:
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+def attach_to_master(dev_name: str, seat: int) -> bool:
+    """Показать uinput-устройство X-серверу и привязать к мастеру места."""
+    master = master_name(seat)
+    mid = master_id(master)
+    for _ in range(40):
+        ids = [i for i in xinput("list", "--id-only", dev_name).split() if i.isdigit()]
+        if ids:
+            xinput("reattach", ids[0], master)
+            for line in xinput("list").splitlines():
+                if dev_name in line and f"id={ids[0]}" in line:
+                    return bool(mid) and f"({mid})" in line
+            return bool(mid)
+        time.sleep(0.1)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# evdev
+# ---------------------------------------------------------------------------
+try:
+    from evdev import ecodes, InputDevice, list_devices
+except ImportError:
+    print("foxhole-input: нужен python3-evdev (dnf install python3-evdev)", file=sys.stderr)
+    raise SystemExit(2)
+
+MOD_KEYS = {
+    "ctrl": {ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL},
+    "alt": {ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT},
+    "shift": {ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT},
+    "super": {ecodes.KEY_LEFTMETA, ecodes.KEY_RIGHTMETA},
+}
+MOD_CODES = set().union(*MOD_KEYS.values())
+
+SIDE_BUTTONS = {ecodes.BTN_SIDE, ecodes.BTN_EXTRA}
+NAMED_KEYS = {
+    "side": SIDE_BUTTONS,
+    "extra": {ecodes.BTN_EXTRA},
+    "back": {ecodes.KEY_BACK},
+    "forward": {ecodes.KEY_FORWARD},
+    "insert": {ecodes.KEY_INSERT},
+    "delete": {ecodes.KEY_DELETE},
+    "home": {ecodes.KEY_HOME},
+    "end": {ecodes.KEY_END},
+    "pageup": {ecodes.KEY_PAGEUP},
+    "pagedown": {ecodes.KEY_PAGEDOWN},
+    "space": {ecodes.KEY_SPACE},
+    "enter": {ecodes.KEY_ENTER},
+    "mouse1": {ecodes.BTN_LEFT},
+    "mouse2": {ecodes.BTN_RIGHT},
+    "mouse3": {ecodes.BTN_MIDDLE},
+    "mouse4": {ecodes.BTN_SIDE},
+    "mouse5": {ecodes.BTN_EXTRA},
+}
+
+
+def key_codes(name: str) -> set[int]:
+    """Имя клавиши/кнопки -> набор evdev-кодов (для 'side' — обе боковые)."""
+    name = name.strip().lower()
+    if name in NAMED_KEYS:
+        return set(NAMED_KEYS[name])
+    if len(name) == 1 and name.isalnum():
+        name = f"key_{name}"
+    attr = name if name.startswith("key_") else f"key_{name}"
+    code = getattr(ecodes, attr.upper(), None)
+    if code is None:
+        raise ValueError(f"неизвестная клавиша/кнопка {name!r}")
+    return {code}
+
+
+class Trigger:
+    """Привязка: набор кодов + требуемые модификаторы."""
+
+    def __init__(self, spec: str):
+        self.spec = spec
+        self.mods: set[int] = set()
+        parts = [p.strip() for p in spec.split("+") if p.strip()]
+        if not parts:
+            raise ValueError("пустой триггер")
+        *mods, last = parts
+        for m in mods:
+            m = m.lower()
+            if m not in MOD_KEYS:
+                raise ValueError(f"неизвестный модификатор {m!r} в {spec!r}")
+            self.mods |= MOD_KEYS[m]
+        kind, _, val = last.partition(":")
+        if not val:
+            kind, val = ("key", last) if ":" not in last else (kind, val)
+        if kind == "mouse":
+            val = val if val in NAMED_KEYS else f"mouse{val}"
+        self.codes = key_codes(val)
+        self.spec = spec
+
+    def __repr__(self) -> str:
+        return self.spec
+
+
+class Action:
+    """click:<секунд между кликами> | hold:left | hold:right."""
+
+    def __init__(self, spec: str):
+        kind, _, arg = spec.partition(":")
+        self.kind = kind.strip().lower()
+        self.arg = arg.strip().lower()
+        if self.kind == "click":
+            self.interval = float(self.arg) if self.arg else 0.05
+            if self.interval <= 0:
+                raise ValueError("интервал клика должен быть > 0")
+        elif self.kind == "hold":
+            if self.arg not in BUTTONS:
+                raise ValueError(f"hold: неизвестная кнопка {self.arg!r} (left/right)")
+        else:
+            raise ValueError(f"неизвестное действие {self.kind!r} (click/hold)")
+
+    def __repr__(self) -> str:
+        return f"{self.kind}:{self.arg}"
+
+
+class Binding:
+    def __init__(self, raw: dict):
+        self.trigger = Trigger(str(raw["trigger"]))
+        self.action = Action(str(raw["action"]))
+        self.device = str(raw.get("device", "")).strip().lower() or None
+        seat = raw.get("seat", "auto")
+        self.seat = "auto" if str(seat).strip().lower() == "auto" else int(seat)
+
+    def matches_device(self, dev_name: str) -> bool:
+        return self.device is None or self.device in (dev_name or "").lower()
+
+    def __repr__(self) -> str:
+        return f"{self.trigger.spec} -> {self.action} seat={self.seat}"
+
+
+DEFAULT_CONFIG = """\
+# foxhole-input — привязки автокликера к клавишам и кнопкам мышей.
+# Формат TOML. Триггеры:   key:j | key:4 | ctrl+alt+a | mouse:side | mouse:extra
+# Действия:   click:<секунд между кликами> | hold:left | hold:right
+# device  — необязательная подстрока имени evdev-устройства
+# seat    — auto | 1 | 2   (auto = место того устройства, с которого нажали;
+#                           1/2 = жёстко, привязка срабатывает только с этого места,
+#                           если не задан device)
+#
+# Клик и удержание — переключатели: нажал — включилось, нажал ещё — выключилось.
+
+# Боковая кнопка любой мыши: клик по курсору ЭТОЙ мыши (место определяется само).
+[[bind]]
+trigger = "mouse:side"
+action  = "click:0.05"
+seat    = "auto"
+
+# Клавиша J: быстрый клик на месте этой клавиатуры.
+[[bind]]
+trigger = "key:j"
+action  = "click:0.05"
+seat    = "auto"
+
+# Твинк: клавиша 4 зажимает ПКМ на втором месте.
+# seat = 2 ⇒ сработает только с клавиатуры второго места.
+[[bind]]
+trigger = "key:4"
+action  = "hold:right"
+seat    = 2
+
+# Совместимость со старыми привязками:
+[[bind]]
+trigger = "ctrl+alt+a"
+action  = "click:20"
+seat    = 1
+
+[[bind]]
+trigger = "key:insert"
+action  = "click:0.05"
+seat    = 1
+"""
+
+
+def config_path() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "foxhole-dual", "input.toml")
+
+
+def load_bindings(path: str, create: bool = True) -> list[Binding]:
+    if not os.path.exists(path):
+        if not create:
+            return []
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(DEFAULT_CONFIG)
+        log(f"создан конфиг по умолчанию: {path}", always=True)
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    binds = [Binding(b) for b in data.get("bind", [])]
+    if not binds:
+        raise SystemExit(f"foxhole-input: в {path} нет ни одной [[bind]]")
+    return binds
+
+
+# ---------------------------------------------------------------------------
+# Кликер одного места
+# ---------------------------------------------------------------------------
+class SeatClicker:
+    def __init__(self, seat: int):
+        self.seat = seat
+        self.dev = UInputDevice(f"foxhole-input seat{seat}")
+        attach_to_master(self.dev.name, seat)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.held: str | None = None
+
+    def start_click(self, interval: float) -> None:
+        self.stop_click()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, args=(interval,), daemon=True)
+        self._thread.start()
+
+    def _loop(self, interval: float) -> None:
+        while not self._stop.is_set():
+            self.dev.press("left")
+            time.sleep(0.008)
+            self.dev.release("left")
+            self._stop.wait(interval)
+
+    def stop_click(self) -> None:
+        if self._thread:
+            self._stop.set()
+            self._thread.join(timeout=2)
+            self._thread = None
+        self._stop.clear()
+
+    def hold(self, button: str) -> None:
+        self.unhold()
+        self.dev.press(button)
+        self.held = button
+
+    def unhold(self) -> None:
+        if self.held:
+            self.dev.release(self.held)
+            self.held = None
+
+    def close(self) -> None:
+        self.stop_click()
+        self.unhold()
+        self.dev.close()
+
+
+# ---------------------------------------------------------------------------
+# Демон
+# ---------------------------------------------------------------------------
+class Daemon:
+    def __init__(self, bindings: list[Binding]):
+        self.bindings = bindings
+        self.seat_map: dict[str, int] = {}
+        self.held_codes: set[int] = set()
+        self.active: dict[int, str] = {}      # id(binding) -> "click"/"hold"
+        self.last_fire: dict[int, float] = {}  # id(binding) -> monotonic
+        self.clickers: dict[int, SeatClicker] = {}
+        self.sel = selectors.DefaultSelector()
+        self.known: set[str] = set()
+        self.running = True
+        self.last_map = 0.0
+        self.last_refresh = 0.0
+
+    # --- устройства --------------------------------------------------------
+    def refresh_devices(self) -> None:
+        wanted = set().union(*(b.trigger.codes for b in self.bindings))
+        for path in list_devices():
+            if path in self.known:
+                continue
+            try:
+                dev = InputDevice(path)
+                if (dev.name or "").startswith("foxhole-input"):
+                    continue  # не слушаем собственные uinput-устройства
+                caps = dev.capabilities(verbose=False).get(ecodes.EV_KEY, [])
+                codes = set(caps)
+                if codes & wanted:
+                    self.sel.register(dev, selectors.EVENT_READ)
+                    self.known.add(path)
+                    log(f"слушаю {dev.name} ({path})")
+            except Exception:
+                pass
+
+    def refresh_seat_map(self) -> None:
+        out = xinput("list")
+        second_ids = set()
+        for line in out.splitlines():
+            if "master" in line and "second" in line:
+                m = re.search(r"id=(\d+)", line)
+                if m:
+                    second_ids.add(m.group(1))
+        mapping: dict[str, int] = {}
+        for line in out.splitlines():
+            if "[slave" not in line:
+                continue
+            mid = re.search(r"id=(\d+)", line)
+            parent = re.search(r"\((\d+)\)", line)
+            if not (mid and parent):
+                continue
+            name = re.sub(r"\s+id=\d+.*$", "", line)
+            name = re.sub(r"^[^0-9A-Za-z]+", "", name)
+            name = re.sub(r"\s+", " ", name).strip().lower()
+            mapping[name] = 2 if parent.group(1) in second_ids else 1
+        self.seat_map = mapping
+        self.last_map = time.time()
+
+    def seat_of(self, dev_name: str | None) -> int:
+        key = re.sub(r"\s+", " ", dev_name or "").strip().lower()
+        return self.seat_map.get(key, 1)
+
+    # --- действия ----------------------------------------------------------
+    def clicker(self, seat: int) -> SeatClicker:
+        if seat not in self.clickers:
+            self.clickers[seat] = SeatClicker(seat)
+        return self.clickers[seat]
+
+    def fire(self, bind: Binding, dev_seat: int) -> None:
+        seat = dev_seat if bind.seat == "auto" else int(bind.seat)
+        clicker = self.clicker(seat)
+        key = id(bind)
+        if bind.action.kind == "click":
+            if key in self.active:
+                clicker.stop_click()
+                self.active.pop(key, None)
+                log(f"OFF  {bind.trigger.spec} -> клик (место {seat})", always=True)
+            else:
+                clicker.start_click(bind.action.interval)
+                self.active[key] = "click"
+                log(f"ON   {bind.trigger.spec} -> клик {bind.action.interval:g}s (место {seat})",
+                    always=True)
+        else:  # hold
+            button = bind.action.arg
+            if clicker.held == button:
+                clicker.unhold()
+                self.active.pop(key, None)
+                log(f"OFF  {bind.trigger.spec} -> {button} отпущена (место {seat})", always=True)
+            else:
+                clicker.hold(button)
+                self.active[key] = "hold"
+                log(f"HOLD {bind.trigger.spec} -> {button} зажата (место {seat})", always=True)
+
+    def handle(self, dev, ev) -> None:
+        if ev.type != ecodes.EV_KEY:
+            return
+        code = ev.code
+        if ev.value == 1:
+            self.held_codes.add(code)
+            if code in MOD_CODES:
+                return
+            for bind in self.bindings:
+                if code not in bind.trigger.codes:
+                    continue
+                if not bind.trigger.mods <= self.held_codes:
+                    continue
+                if not bind.trigger.mods and (self.held_codes & MOD_CODES):
+                    continue
+                if not bind.matches_device(dev.name):
+                    continue
+                dev_seat = self.seat_of(dev.name)
+                if bind.seat != "auto" and bind.device is None and dev_seat != int(bind.seat):
+                    continue
+                key = id(bind)
+                now = time.monotonic()
+                if now - self.last_fire.get(key, 0.0) < 0.25:
+                    continue
+                self.last_fire[key] = now
+                self.fire(bind, dev_seat)
+                break
+        elif ev.value == 0:
+            self.held_codes.discard(code)
+
+    def run(self) -> None:
+        self.refresh_devices()
+        self.refresh_seat_map()
+        print(f"foxhole-input: запущен, привязок: {len(self.bindings)}", flush=True)
+        try:
+            while self.running:
+                now = time.time()
+                if now - self.last_refresh > 1.0:
+                    self.refresh_devices()
+                    self.last_refresh = now
+                if now - self.last_map > 2.0:
+                    self.refresh_seat_map()
+                for key, _ in self.sel.select(timeout=1.0):
+                    dev = key.fileobj
+                    try:
+                        for ev in dev.read():
+                            self.handle(dev, ev)
+                    except OSError:
+                        try:
+                            self.sel.unregister(dev)
+                        except Exception:
+                            pass
+                        self.known.discard(dev.path)
+        finally:
+            for c in self.clickers.values():
+                c.close()
+            self.clickers.clear()
+
+    def shutdown(self, *_args) -> None:
+        self.running = False
+
+
+
+# ---------------------------------------------------------------------------
+# Устройства: список, выбор, конфиг мест
+# ---------------------------------------------------------------------------
+def x_devices() -> list[tuple[int, str, str, int]]:
+    """[(id, класс, имя, место)] — только slave-устройства из xinput."""
+    out = xinput("list", "--short")
+    second_ids: set[str] = set()
+    for line in out.splitlines():
+        if "master" in line and "second" in line:
+            m = re.search(r"id=(\d+)", line)
+            if m:
+                second_ids.add(m.group(1))
+    rows = []
+    for line in out.splitlines():
+        m = re.search(r"id=(\d+)\s*\[([^\]]+)\]", line)
+        if not m:
+            continue
+        dev_id, cls = int(m.group(1)), m.group(2)
+        name = re.sub(r"^[^\w]+", "", line[: m.start()])
+        name = re.sub(r"\s+", " ", name).strip()
+        parent = re.search(r"\((\d+)\)", cls)
+        seat = 2 if parent and parent.group(1) in second_ids else 1
+        rows.append((dev_id, cls, name, seat))
+    return rows
+
+
+NOISE = ("Power Button", "Sleep Button", "Video Bus", "PC Speaker",
+         "Consumer Control", "System Control", "XTEST")
+
+
+def list_seat_devices():
+    """Реальные клавиатуры и мыши, без служебных суб-устройств."""
+    rows = [r for r in x_devices() if "slave" in r[1]]
+    kbs = [r for r in rows if "keyboard" in r[1]
+           and not any(n in r[2] for n in NOISE)
+           and "MOUSE" not in r[2].upper()]          # суб-клавиатура мыши
+    mice = [r for r in rows if "pointer" in r[1]
+            and not any(n in r[2] for n in NOISE)
+            and not r[2].endswith(" Keyboard")]      # pointer-класс суб-мыши
+    return kbs, mice
+
+
+def devices_conf_path() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "foxhole-dual", "devices.conf")
+
+
+def write_devices_conf(path: str, kbd: str, mouse: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("# Какие физические устройства отданы второму месту (seat2).\n")
+        f.write("# Читает seat2-start. Остальные устройства остаются на основном месте.\n")
+        f.write(f'seat2_keyboard="{kbd}"\n')
+        f.write(f'seat2_mouse="{mouse}"\n')
+
+
+def _pick(title: str, items: list[tuple[int, str, str, int]], default_seat2: str | None) -> str:
+    print(title)
+    for i, (dev_id, _cls, name, seat) in enumerate(items, 1):
+        mark = "  <-- сейчас второе место" if name == default_seat2 else ""
+        print(f"  {i}) {name:<32} место {seat}{mark}")
+    default = ""
+    if default_seat2:
+        for i, (_id, _c, name, _s) in enumerate(items, 1):
+            if name == default_seat2:
+                default = str(i)
+    prompt = f"Выбор [{default or '1'}]: "
+    while True:
+        try:
+            raw = input(prompt).strip() or default or "1"
+        except EOFError:
+            raise SystemExit("foxhole-input setup: нет ввода (используйте --auto)")
+        if raw.isdigit() and 1 <= int(raw) <= len(items):
+            return items[int(raw) - 1][2]
+
+
+def cmd_devices(_args) -> int:
+    kbs, mice = list_seat_devices()
+    print("Клавиатуры:")
+    for _id, _cls, name, seat in kbs:
+        print(f"  {name:<32} место {seat}")
+    print("Мыши:")
+    for _id, _cls, name, seat in mice:
+        print(f"  {name:<32} место {seat}")
+    path = devices_conf_path()
+    print(f"\nconfig мест: {path}")
+    if os.path.exists(path):
+        print(open(path).read())
+    else:
+        print("(нет — второе место настраивается по умолчанию/переменными MPX_*)")
+    return 0
+
+
+def cmd_setup(args) -> int:
+    kbs, mice = list_seat_devices()
+    if not kbs or not mice:
+        print("не вижу клавиатур/мышей в X (нужен Xorg)", file=sys.stderr)
+        return 1
+    cur_kbd = next((n for _i, _c, n, s in kbs if s == 2), None)
+    cur_mouse = next((n for _i, _c, n, s in mice if s == 2), None)
+
+    if args.auto:
+        kbd, mouse = cur_kbd, cur_mouse
+        if not kbd or not mouse:
+            print("--auto: второе место сейчас не назначено; укажите вручную", file=sys.stderr)
+            return 1
+    elif args.seat2_kbd and args.seat2_mouse:
+        kbd, mouse = args.seat2_kbd, args.seat2_mouse
+    else:
+        kbd = _pick("\nКлавиатура для ВТОРОГО места:", kbs, cur_kbd)
+        mouse = _pick("\nМышь для ВТОРОГО места:", mice, cur_mouse)
+
+    path = args.config or devices_conf_path()
+    write_devices_conf(path, kbd, mouse)
+    print(f"\nзаписано: {path}")
+    print(f"  seat2_keyboard={kbd!r}")
+    print(f"  seat2_mouse={mouse!r}")
+    print("применится при следующем запуске seat2-start (после перелогина или вручную).")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+LOCK_PATH = "/tmp/foxhole-input%s.lock" % os.environ.get("DISPLAY", ":0").replace(":", "_").replace(".", "_")
+
+
+def daemon_pid() -> int | None:
+    try:
+        with open(LOCK_PATH) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except Exception:
+        return None
+
+
+def cmd_run(args) -> int:
+    global VERBOSE
+    VERBOSE = args.verbose
+    try:
+        lock = open(LOCK_PATH, "w")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("foxhole-input: уже запущен", file=sys.stderr)
+        return 1
+    lock.write(str(os.getpid()))
+    lock.flush()
+
+    binds = load_bindings(args.config or config_path())
+    for b in binds:
+        print(f"  {b.trigger.spec:<16} -> {b.action!s:<12} seat={b.seat}", flush=True)
+    d = Daemon(binds)
+    signal.signal(signal.SIGTERM, d.shutdown)
+    signal.signal(signal.SIGINT, d.shutdown)
+    d.run()
+    return 0
+
+
+def cmd_stop(_args) -> int:
+    pid = daemon_pid()
+    if not pid:
+        print("не запущен")
+        return 0
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(40):
+        time.sleep(0.05)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            print("остановлен")
+            return 0
+    os.kill(pid, signal.SIGKILL)
+    print("остановлен (SIGKILL)")
+    return 0
+
+
+def cmd_status(_args) -> int:
+    pid = daemon_pid()
+    print(f"daemon: {'running pid ' + str(pid) if pid else 'не запущен'}")
+    for name in (MASTER_CORE_POINTER, MASTER_SECOND_POINTER):
+        mid = master_id(name)
+        print(f"  {name}: {'id=' + mid if mid else 'нет (MPX не поднят)'}")
+    path = config_path()
+    print(f"config: {path}")
+    for b in load_bindings(path, create=False):
+        print(f"  {b.trigger.spec:<16} -> {b.action!s:<12} seat={b.seat}"
+              f"{'  device~' + b.device if b.device else ''}")
+    return 0
+
+
+def cmd_doctor(_args) -> int:
+    ok = True
+    if os.access("/dev/uinput", os.W_OK):
+        print("/dev/uinput: доступен")
+    else:
+        print("/dev/uinput: НЕТ доступа (ACL/udev или группа input)")
+        ok = False
+    try:
+        import evdev  # noqa: F401
+        from evdev import InputDevice as _ID, list_devices as _ld
+
+        readable = 0
+        for p in _ld():
+            try:
+                _ID(p).capabilities()
+                readable += 1
+            except Exception:
+                pass
+        print(f"python3-evdev: есть, читаемых устройств: {readable}")
+        if not readable:
+            ok = False
+    except ImportError:
+        print("python3-evdev: НЕ установлен (dnf install python3-evdev)")
+        ok = False
+    for name in (MASTER_CORE_POINTER, MASTER_SECOND_POINTER):
+        mid = master_id(name)
+        print(f"{name}: {'id=' + mid if mid else 'нет (MPX не поднят)'}")
+        if not mid:
+            ok = False
+    return 0 if ok else 1
+
+
+def cmd_config(_args) -> int:
+    path = config_path()
+    print(f"# {path}")
+    print(open(path).read() if os.path.exists(path) else DEFAULT_CONFIG)
+    return 0
+
+
+def cmd_init(args) -> int:
+    path = args.config or config_path()
+    if os.path.exists(path) and not args.force:
+        print(f"уже есть: {path} (--force чтобы перезаписать)")
+        return 0
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(DEFAULT_CONFIG)
+    print(f"создан: {path}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="foxhole-input",
+        description="Автокликер и привязки ввода для двухместной схемы Foxhole",
+    )
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("run", help="запустить демон")
+    p.add_argument("--config")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=cmd_run)
+
+    for name, fn, hlp in (
+        ("stop", cmd_stop, "остановить демон"),
+        ("status", cmd_status, "состояние и привязки"),
+        ("doctor", cmd_doctor, "проверить окружение"),
+        ("config", cmd_config, "показать конфиг"),
+    ):
+        sp = sub.add_parser(name, help=hlp)
+        sp.set_defaults(func=fn)
+
+    sp = sub.add_parser("devices", help="показать устройства и их места")
+    sp.set_defaults(func=cmd_devices)
+
+    sp = sub.add_parser("setup", help="назначить клавиатуру/мышь второму месту")
+    sp.add_argument("--auto", action="store_true", help="взять текущее второе место")
+    sp.add_argument("--seat2-kbd")
+    sp.add_argument("--seat2-mouse")
+    sp.add_argument("--config")
+    sp.set_defaults(func=cmd_setup)
+
+    sp = sub.add_parser("init", help="создать конфиг по умолчанию")
+    sp.add_argument("--config")
+    sp.add_argument("--force", action="store_true")
+    sp.set_defaults(func=cmd_init)
+
+    args = ap.parse_args()
+    if not getattr(args, "func", None):
+        ap.print_help()
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

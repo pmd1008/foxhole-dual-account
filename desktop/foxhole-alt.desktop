@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Foxhole — аккаунт B
+Comment=Второй Steam-клиент (HOME=~/steam-alt, IPC-порт 57344) + Foxhole
+Exec=/usr/local/bin/foxhole-alt
+Icon=steam
+Terminal=false
+Categories=Game;
+StartupNotify=true

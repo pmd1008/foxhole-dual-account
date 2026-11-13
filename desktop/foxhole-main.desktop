@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Foxhole — аккаунт A
+Comment=Основной Steam-клиент (IPC-порт по умолчанию 57343) + Foxhole
+Exec=/usr/local/bin/foxhole-main
+Icon=steam
+Terminal=false
+Categories=Game;
+StartupNotify=true

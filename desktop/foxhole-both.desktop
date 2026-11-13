@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Foxhole — оба аккаунта
+Comment=Два окна Foxhole: основной аккаунт (порт 57343) + второй (57344)
+Exec=/usr/local/bin/foxhole-both
+Icon=steam
+Terminal=false
+Categories=Game;
+StartupNotify=true
